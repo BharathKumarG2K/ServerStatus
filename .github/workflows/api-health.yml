@@ -1,0 +1,91 @@
+name: API Health Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # every 15 minutes (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to commit the state file
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Probe endpoints
+        id: probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URLS=("https://www.yrscrackers.com" "https://www.yrscrackers.com/mobile_app_new/product/catalog.php?mode=get_order_notes")
+
+          overall="UP"
+          details=()
+
+          for u in "${URLS[@]}"; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "$u" || echo "000")
+            details+=("${u}=${code}")
+            if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
+              overall="DOWN"
+            fi
+          done
+
+          echo "overall=${overall}" >> "$GITHUB_OUTPUT"
+          printf "%s\n" "${details[@]}" > health_details.txt
+
+      - name: Read previous state
+        id: prev
+        shell: bash
+        run: |
+          set -euo pipefail
+          state_file=".github/monitor/state.json"
+          if [[ -f "$state_file" ]]; then
+            prev=$(jq -r '.overall // "UNKNOWN"' "$state_file")
+          else
+            prev="UNKNOWN"
+          fi
+          echo "prev=${prev}" >> "$GITHUB_OUTPUT"
+
+      - name: Send email on change
+        id: notify
+        if: ${{ steps.prev.outputs.prev != steps.probe.outputs.overall }}
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "API status changed: ${{ steps.prev.outputs.prev }} → ${{ steps.probe.outputs.overall }} | ${{ github.repository }}"
+          to: "alerts@example.com,team@example.com"
+          from: "GitHub Actions <alerts@example.com>"
+          html_body: |
+            <p>Status changed from <b>${{ steps.prev.outputs.prev }}</b> to <b>${{ steps.probe.outputs.overall }}</b>.</p>
+            <p>Run: <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Logs</a></p>
+            <p>Details:</p>
+            <pre>$(printf "%s\n" "$(cat health_details.txt)")</pre>
+          convert_markdown: false
+
+      - name: Update state on change
+        if: ${{ steps.prev.outputs.prev != steps.probe.outputs.overall }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github/monitor
+          ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          details_json=$(jq -Rn '[inputs | split("=") | {url: .[0], code: .[1]}]' < health_details.txt)
+          jq -n --arg overall "${{ steps.probe.outputs.overall }}" --arg ts "$ts" --argjson details "$details_json" \
+            '{overall:$overall, changed_at:$ts, details:$details}' > .github/monitor/state.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/monitor/state.json
+          git commit -m "monitor: ${{ steps.prev.outputs.prev }} -> ${{ steps.probe.outputs.overall }} at $ts" || echo "No changes to commit"
+          git push
